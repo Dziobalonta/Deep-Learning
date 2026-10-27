@@ -5,7 +5,10 @@ import torch
 import torchvision
 import torch.nn as nn
 import torchvision.transforms as T
+import torch.nn.functional as F
 import math
+import copy
+from pathlib import Path
 from torch.utils.data import DataLoader, Subset
 from sklearn.model_selection import train_test_split
 
@@ -14,7 +17,9 @@ SEED = 42
 torch.manual_seed(SEED)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DATA_DIR = "./data"
+
+# data/ next to src/, no matter where we run from
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
 
 def get_dataloaders(data_dir, val_size=5000, batch_size=128, seed=SEED):
@@ -69,7 +74,7 @@ def get_dataloaders(data_dir, val_size=5000, batch_size=128, seed=SEED):
 
     return train_loader, val_loader, test_loader
 
-class HighwayNetwork(nn.Module):
+class HighwayLayer(nn.Module):
     """Highway convolutional layer:
     y = H(x)*T(x) + x*(1 - T(x))
     H = conv + ReLU (transform)
@@ -96,9 +101,20 @@ class HighwayNetwork(nn.Module):
         nn.init.constant_(self.gate.bias, gate_bias)
 
     def forward(self, x):
-        H = self.transform(x)
+        H = F.relu(self.transform(x))
         T = torch.sigmoid(self.gate(x))
         return H * T + x * (1 - T)
+
+class PlainConv(nn.Module):
+    """Plain conv layer: y = ReLU(conv(x)). Same shape in and out, no gate."""
+
+    def __init__(self, channels, kernel_size=3):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels=channels, out_channels=channels, kernel_size=kernel_size, padding=kernel_size // 2)
+
+    def forward(self, x):
+        return F.relu(self.conv(x))
+
 
 def train_one_epoch(model, loader, criterion, optimizer, device):
     model.train() # training mode
@@ -133,6 +149,42 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
 
     return total_loss / total, correct / total
 
+class Net(nn.Module):
+    """CIFAR-10 network built from highway or plain layers.
+    widths = channels per stage, layers_per_stage = N, layer_type = HighwayConv or PlainConv
+    """
+    def __init__(self, layer_type, layers_per_stage=3, widths=(32, 64, 128), num_classes=10, conv_init=False):
+        super().__init__()
+        layers = []
+        in_ch = 3
+        for i, width in enumerate(widths):
+
+            if i > 0:
+                # MaxPool2d(2): halves height and width (32→16→8), channels stay the same
+                layers.append(nn.MaxPool2d(2))
+            layers.append(nn.Conv2d(in_ch, width, 3, padding=1)) # plain conv: change channels
+            layers.append(nn.ReLU())
+            for _ in range(layers_per_stage):
+                layers.append(layer_type(width)) # highway (or plain) layers
+            in_ch = width
+
+        self.features = nn.Sequential(*layers) # all the layers packed into one block
+        self.pool = nn.AdaptiveAvgPool2d(1)	 # squash each grid to one number(C, 8, 8) -> (C, 1, 1)
+        self.classifier = nn.Linear(widths[-1], num_classes)	# computes 10 weighted sums, one per class
+
+        if conv_init:
+            # He init for all convs: keeps signal size stable through conv+ReLU (paper Sec 3.1)
+            for m in self.modules():
+                if isinstance(m, nn.Conv2d):
+                    nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+
+
+    def forward(self, x):
+        x = self.features(x) # pushes the batch through all the bricks in order
+        x = self.pool(x).flatten(1)		# avg each 8×8 grid → 1 number, drop the 1×1
+        return self.classifier(x)		# raw scores (logits), no softmax
+
+
 @torch.no_grad() # no gradients needed - faster, less memory
 def evaluate(model, loader, criterion, device):
     model.eval() # evaluation mode
@@ -153,6 +205,35 @@ def evaluate(model, loader, criterion, device):
 
     return total_loss / total, correct / total
 
+def run_experiment(model, train_loader, val_loader, epochs, lr, momentum, device):
+    model = model.to(device)
+    criterion = nn.CrossEntropyLoss() # softmax + cross-entropy
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=5e-4)
+
+    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
+    best_acc = 0.0
+    best_state = None
+
+    for epoch in range(epochs):
+        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+
+        history["train_loss"].append(train_loss)
+        history["train_acc"].append(train_acc)
+        history["val_loss"].append(val_loss)
+        history["val_acc"].append(val_acc)
+
+        if val_acc > best_acc:
+            best_acc = val_acc
+            best_state = copy.deepcopy(model.state_dict())
+
+        print(f"epoch {epoch + 1:2d} | train loss {train_loss:.3f} acc {train_acc:.3f} "
+              f"| val loss {val_loss:.3f} acc {val_acc:.3f}")
+
+    model.load_state_dict(best_state)   # go back to the best epoch
+    return history, best_acc
+
+
 if __name__ == "__main__":
     # Data prep
     train_loader, val_loader, test_loader = get_dataloaders(DATA_DIR)
@@ -163,21 +244,13 @@ if __name__ == "__main__":
 
 
     # Testing the Highway layer
-    layer = HighwayNetwork(channels=16)
+    layer = HighwayLayer(channels=16)
     x = torch.randn(8, 16, 32, 32)
     y = layer(x)
     print("in :", tuple(x.shape), "out:", tuple(y.shape))
     print("gate mean at init:", torch.sigmoid(layer.gate(x)).mean().item())
     print("params:", sum(p.numel() for p in layer.parameters()))
-
-    
-    # criterion = nn.CrossEntropyLoss().to(DEVICE) # softmax + cross-entropy
-    # train_one_epoch(layer, train_loader, criterion, torch.optim.Adam(layer.parameters()), DEVICE)
-    
-    # Testing the training loop with the simplest model: softmax regression
-    model = nn.Sequential(nn.Flatten(), nn.Linear(3 * 32 * 32, 10)).to(DEVICE)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
+    print()
 
     # Base line: 5,000 imgs, 10 classes, dataset is balanced = Random guessing accuracy = 1/10 = 0.1
     print("baseline accuracy:", 1 / 10)
@@ -187,10 +260,22 @@ if __name__ == "__main__":
     # p = (0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1)      # 10 classes, each 1/10
     loss_base = - math.log(0.1)
     print("baseline loss:", loss_base)
+    print()
 
+    print("=== Highway ===")
+    for lr in [0.3, 0.1, 0.03, 0.01, 0.003]:
+        torch.manual_seed(SEED) # same starting weights for every lr
+        model = Net(HighwayLayer, layers_per_stage=3, conv_init=True)
+        print(f"\n--- lr = {lr} ---")
+        history, best_acc = run_experiment(model, train_loader, val_loader, epochs=6, lr=lr, momentum=0.9, device=DEVICE)
+        print("best val acc:", best_acc)
+    print()
 
-
-    for epoch in range(3):
-        loss, acc = train_one_epoch(model, train_loader, criterion, optimizer, DEVICE)
-        print(f"epoch {epoch + 1}: train loss {loss:.3f}, train accur {acc:.3f}")
+    print("=== PlainConv ===")
+    for lr in [0.3, 0.1, 0.03, 0.01, 0.003]:
+        torch.manual_seed(SEED) # same starting weights for every lr
+        model = Net(PlainConv, layers_per_stage=3, conv_init=True)
+        print(f"\n--- lr = {lr} ---")
+        history, best_acc = run_experiment(model, train_loader, val_loader, epochs=6, lr=lr, momentum=0.9, device=DEVICE)
+        print("best val acc:", best_acc)
 
