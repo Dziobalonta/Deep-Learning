@@ -134,7 +134,15 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
         # Bigger means the model believes it more. TYhe highest is "cat" (2.1), so the model guesses cat
 
         loss = criterion(output, labels)
+
+        loss = criterion(output, labels)
+        if torch.isnan(loss):
+            raise RuntimeError("loss is nan - training aborted")
+
         loss.backward() # Backpropagation, computing gradient of the loss with respect to every weight
+
+        #  if the total size of the gradient is above 5, scale the whole gradient down to size 5
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0) 
 
         optimizer.step() # Updating weights based on the computed gradients
 
